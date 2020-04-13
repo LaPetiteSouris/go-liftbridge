@@ -80,6 +80,13 @@ type StreamOptions struct {
 	// cluster.
 	ReplicationFactor int32
 
+	// ReplicationFactorNonISR controls the number of non-ISR servers to replicate a stream
+	// a non-ISR server is a follower replica server, which is a part of the partition's replicas
+	// not participating in ISR.
+	// to. E.g. a value of 1 would mean 1 server would have the data and this server
+	// would not participate in ISR procoess. If this is not set, defaut value is 0.
+	ReplicationFactorNonISR int32
+
 	// Partitions determines how many partitions to create for a stream. If 0,
 	// this will behave as a stream with a single partition. If this is not
 	// set, it defaults to 1.
@@ -109,6 +116,18 @@ func Group(group string) StreamOption {
 func ReplicationFactor(replicationFactor int32) StreamOption {
 	return func(o *StreamOptions) error {
 		o.ReplicationFactor = replicationFactor
+		return nil
+	}
+}
+
+// ReplicationFactorNonISR controls the number of non-ISR servers to replicate a stream
+// A non-ISR server is a follower replica server, which is a part of the partition's replicas
+// not participating in ISR.
+// to. E.g. a value of 1 would mean 1 server would have the data and this server
+// would not participate in ISR procoess. If this is not set, defaut value is 0.
+func ReplicationFactorNonISR(ReplicationFactorNonISR int32) StreamOption {
+	return func(o *StreamOptions) error {
+		o.ReplicationFactorNonISR = ReplicationFactorNonISR
 		return nil
 	}
 }
@@ -416,11 +435,12 @@ func (c *client) CreateStream(ctx context.Context, subject, name string, options
 	}
 
 	req := &proto.CreateStreamRequest{
-		Subject:           subject,
-		Name:              name,
-		ReplicationFactor: opts.ReplicationFactor,
-		Group:             opts.Group,
-		Partitions:        opts.Partitions,
+		Subject:                 subject,
+		Name:                    name,
+		ReplicationFactor:       opts.ReplicationFactor,
+		ReplicationFactornonISR: opts.ReplicationFactorNonISR,
+		Group:                   opts.Group,
+		Partitions:              opts.Partitions,
 	}
 	err := c.doResilientRPC(func(client proto.APIClient) error {
 		_, err := client.CreateStream(ctx, req)
@@ -524,6 +544,10 @@ type SubscriptionOptions struct {
 
 	// ReadISRReplica sets client's ability to subscribe from a random ISR
 	ReadISRReplica bool
+
+	// ReadnonISRFollower sets client's ability to subscribe from a random follower replica
+	// which is not in ISR
+	ReadNonISRFollower bool
 }
 
 // SubscriptionOption is a function on the SubscriptionOptions for a
@@ -585,6 +609,17 @@ func StartAtEarliestReceived() SubscriptionOption {
 func ReadISRReplica() SubscriptionOption {
 	return func(o *SubscriptionOptions) error {
 		o.ReadISRReplica = true
+		return nil
+	}
+}
+
+// ReadNonISRFollower sets read replica option. If true, the client will request
+// subscription from an random non-ISR replica. This means the replica may not be
+// in sync with the leader. You may use this option only for cases where
+// consistency is less important
+func ReadNonISRFollower() SubscriptionOption {
+	return func(o *SubscriptionOptions) error {
+		o.ReadNonISRFollower = true
 		return nil
 	}
 }
@@ -758,7 +793,7 @@ func (c *client) subscribe(ctx context.Context, stream string,
 		err  error
 	)
 	for i := 0; i < 5; i++ {
-		pool, addr, err = c.getPoolAndAddr(stream, opts.Partition, opts.ReadISRReplica)
+		pool, addr, err = c.getPoolAndAddr(stream, opts.Partition, opts.ReadISRReplica, opts.ReadNonISRFollower)
 		if err != nil {
 			time.Sleep(50 * time.Millisecond)
 			c.metadata.update(ctx)
@@ -773,12 +808,13 @@ func (c *client) subscribe(ctx context.Context, stream string,
 		var (
 			client = proto.NewAPIClient(conn)
 			req    = &proto.SubscribeRequest{
-				Stream:         stream,
-				StartPosition:  opts.StartPosition.toProto(),
-				StartOffset:    opts.StartOffset,
-				StartTimestamp: opts.StartTimestamp.UnixNano(),
-				Partition:      opts.Partition,
-				ReadISRReplica: opts.ReadISRReplica,
+				Stream:             stream,
+				StartPosition:      opts.StartPosition.toProto(),
+				StartOffset:        opts.StartOffset,
+				StartTimestamp:     opts.StartTimestamp.UnixNano(),
+				Partition:          opts.Partition,
+				ReadISRReplica:     opts.ReadISRReplica,
+				ReadNonISRFollower: opts.ReadNonISRFollower,
 			}
 		)
 		st, err = client.Subscribe(ctx, req)
@@ -887,8 +923,8 @@ func (c *client) connFactory(addr string) connFactory {
 
 // getPoolAndAddr returns the connPool and broker address for the given
 // partition.
-func (c *client) getPoolAndAddr(stream string, partition int32, readISRReplica bool) (*connPool, string, error) {
-	addr, err := c.metadata.getAddr(stream, partition, readISRReplica)
+func (c *client) getPoolAndAddr(stream string, partition int32, readISRReplica bool, ReadNonISRFollower bool) (*connPool, string, error) {
+	addr, err := c.metadata.getAddr(stream, partition, readISRReplica, ReadNonISRFollower)
 	if err != nil {
 		return nil, "", err
 	}

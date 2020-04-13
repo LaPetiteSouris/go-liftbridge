@@ -59,10 +59,11 @@ func (s *StreamInfo) Partitions() map[int32]*PartitionInfo {
 
 // PartitionInfo contains information for a Liftbridge stream partition.
 type PartitionInfo struct {
-	id       int32
-	leader   *BrokerInfo
-	replicas []*BrokerInfo
-	isr      []*BrokerInfo
+	id             int32
+	leader         *BrokerInfo
+	replicas       []*BrokerInfo
+	isr            []*BrokerInfo
+	nonisrfollower []*BrokerInfo
 }
 
 // ID of the partition.
@@ -78,6 +79,11 @@ func (p *PartitionInfo) Replicas() []*BrokerInfo {
 // ISR returns the list of replicas currently in the in-sync replica set.
 func (p *PartitionInfo) ISR() []*BrokerInfo {
 	return p.isr
+}
+
+// nonISRFollower returns the list of replicas currently not in the ISR set
+func (p *PartitionInfo) nonISRFollowerISR() []*BrokerInfo {
+	return p.nonisrfollower
 }
 
 // Leader returns the broker acting as leader for this partition or nil if
@@ -244,11 +250,16 @@ func (m *metadataCache) update(ctx context.Context) (*Metadata, error) {
 			for i, replica := range partition.Isr {
 				isr[i] = brokers[replica]
 			}
+			nonisrfollower := make([]*BrokerInfo, len(partition.Nonisrfollower))
+			for i, replica := range partition.Nonisrfollower {
+				nonisrfollower[i] = brokers[replica]
+			}
 			stream.partitions[partition.Id] = &PartitionInfo{
-				id:       partition.Id,
-				leader:   brokers[partition.Leader],
-				replicas: replicas,
-				isr:      isr,
+				id:             partition.Id,
+				leader:         brokers[partition.Leader],
+				replicas:       replicas,
+				isr:            isr,
+				nonisrfollower: nonisrfollower,
 			}
 		}
 		streamIndex.addStream(stream)
@@ -279,7 +290,7 @@ func (m *metadataCache) getAddrs() []string {
 }
 
 // getAddr returns the broker address for the given stream partition.
-func (m *metadataCache) getAddr(stream string, partitionID int32, readISRReplica bool) (string, error) {
+func (m *metadataCache) getAddr(stream string, partitionID int32, readISRReplica bool, ReadNonISRFollower bool) (string, error) {
 	m.mu.RLock()
 	metadata := m.metadata
 	m.mu.RUnlock()
@@ -291,10 +302,23 @@ func (m *metadataCache) getAddr(stream string, partitionID int32, readISRReplica
 	if partition == nil {
 		return "", errors.New("no known partition")
 	}
+	if readISRReplica == true && ReadNonISRFollower == true {
+		return "", errors.New("a specific replica is needed, or leave empty to subscribe to leader")
+	}
 	// Request to subscribe to a random ISR
 	if readISRReplica {
 		replicasISR := partition.ISR()
 		randomReplica := replicasISR[rand.Intn(len(replicasISR))]
+		return randomReplica.Addr(), nil
+	}
+
+	// Request to subscribe to a random non-ISR follower replica
+	if ReadNonISRFollower {
+		nonISRfollowers := partition.nonISRFollowerISR()
+		if len(nonISRfollowers) == 0 {
+			return "", errors.New("non-ISR follower does not exist")
+		}
+		randomReplica := nonISRfollowers[rand.Intn(len(nonISRfollowers))]
 		return randomReplica.Addr(), nil
 	}
 	if partition.Leader() == nil {

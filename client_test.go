@@ -796,6 +796,56 @@ func TestPublishToSubject(t *testing.T) {
 	}
 }
 
+func TestCreateStreamNonISRFollower(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	config1 := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, config1)
+	defer s1.Stop()
+
+	config2 := getTestConfig("b", false, 5051)
+	s2 := runServerWithConfig(t, config2)
+	defer s2.Stop()
+
+	client, err := Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1, s2)
+
+	var (
+		subject = "foo"
+		stream1 = "stream1"
+		stream2 = "stream2"
+		streams = []string{stream1, stream2}
+	)
+	require.NoError(t, client.CreateStream(context.Background(), subject, stream1, ReplicationFactorNonISR(1)))
+	require.NoError(t, client.CreateStream(context.Background(), subject, stream2))
+
+	_, err = client.PublishToSubject(context.Background(), subject, []byte("hello"))
+	require.NoError(t, err)
+
+	// Ensure both streams received the message.
+	for _, stream := range streams {
+		recv := make(chan Message)
+		err = client.Subscribe(context.Background(), stream, func(msg Message, err error) {
+			require.NoError(t, err)
+			recv <- msg
+		}, StartAtEarliestReceived(), ReadNonISRFollower())
+		require.NoError(t, err)
+
+		select {
+		case <-recv:
+		case <-time.After(5 * time.Second):
+			require.Fail(t, "Did not receive expected message")
+		}
+	}
+}
 func ExampleConnect() {
 	addr := "localhost:9292"
 	client, err := Connect([]string{addr})
